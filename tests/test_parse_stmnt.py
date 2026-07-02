@@ -300,6 +300,52 @@ def test_parse_goto_label_single_stmnt():
     """)
 
 
+def test_parse_attribute_texts_preserved():
+    # Attributes we don't interpret ourselves (``aligned``, ``mode``, ...)
+    # are stashed as raw text on the declaration's ``attribs`` list, so
+    # callers can read them back (e.g. PS2 headers using
+    # ``__attribute__((aligned(16)))`` / ``mode(TI)``).
+    s = parse("""
+    typedef int long128 __attribute__((mode(TI)));
+    struct __attribute__((aligned(32))) SPre { int a; };
+    struct SPost { int a; } __attribute__((aligned(8)));
+    struct Plain { int a; };
+    """)
+    assert not s._errors, "unexpected errors: %r" % s._errors
+    # A raw ``aligned(N)`` / ``mode(T)`` text is present (whitespace is
+    # tokenizer-normalised, so match loosely).
+    assert any("mode" in a and "TI" in a for a in s.typedefs["long128"].attribs)
+    assert any("aligned" in a and "32" in a for a in s.structs["SPre"].attribs)
+    assert any("aligned" in a and "8" in a for a in s.structs["SPost"].attribs)
+    # A struct with no attributes stays empty (no leakage from neighbours).
+    assert s.structs["Plain"].attribs == []
+
+    # Invariant: attributes we interpret ourselves (``packed``) are ALSO
+    # kept verbatim in ``attribs`` (recorded in addition to being
+    # interpreted), so ``attribs`` is a complete raw record and starting
+    # to interpret more attributes later won't drop them.
+    s2 = parse("struct __attribute__((packed, aligned(16))) P { int a; };")
+    P = s2.structs["P"]
+    assert P.packed == 1
+    assert any("packed" in a for a in P.attribs)
+    assert any("aligned" in a and "16" in a for a in P.attribs)
+
+
+def test_parse_array_typedef():
+    # ``typedef T name[N];`` (and multi-dim) -- the array dimension used
+    # to be dropped (``CTypedef.finalize`` recomputed the type from the
+    # base tokens, clobbering what array parsing set).
+    s = parse("typedef float V[4]; typedef int M[2][3];")
+    assert not s._errors, "unexpected errors: %r" % s._errors
+    assert isinstance(s.typedefs["V"].type, CArrayType)
+    assert getConstValue(s, s.typedefs["V"].type.arrayLen) == 4
+    assert s.typedefs["V"].type.arrayOf == CBuiltinType(("float",))
+    # Multi-dimensional: outer [2] wraps inner [3].
+    m = s.typedefs["M"].type
+    assert isinstance(m, CArrayType) and getConstValue(s, m.arrayLen) == 2
+    assert isinstance(m.arrayOf, CArrayType) and getConstValue(s, m.arrayOf.arrayLen) == 3
+
+
 def test_parse_array():
     s = parse("int x[10];")
     x = s.vars["x"]

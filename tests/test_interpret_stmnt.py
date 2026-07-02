@@ -4205,6 +4205,29 @@ def test_pointer_size_override():
     assert inst.ptr.value == 0xDEADBEEF
 
 
+def test_array_typedef_member_layout():
+    # ``typedef float Vector3[3]`` used as a struct member must contribute
+    # its full array size.  The array dimension used to be dropped (parser
+    # error swallowed + ``CTypedef.finalize`` clobbering the type), so the
+    # member was sized as a bare ``float`` (4) instead of ``float[3]`` (12).
+    state = parse("""
+    typedef float Vector3[3];
+    typedef float Matrix[2][3];
+    struct S {
+        Vector3 vec;
+        Matrix  mat;
+    };
+    """)
+    interpreter = Interpreter()
+    interpreter.register(state)
+    fsize = ctypes.sizeof(ctypes.c_float)
+    assert ctypes.sizeof(interpreter.getCType(state.typedefs["Vector3"])) == 3 * fsize
+    s_t = interpreter.getCType(state.structs["S"])
+    fields = dict(s_t._fields_)
+    assert ctypes.sizeof(fields["vec"]) == 3 * fsize
+    assert ctypes.sizeof(fields["mat"]) == 2 * 3 * fsize
+
+
 def test_struct_multidim_array():
     # ``int16_t mat[2][3]`` is an array of 2 elements, each an array of 3
     # int16_t (row-major).  The parser used to keep only the last

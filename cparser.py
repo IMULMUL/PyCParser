@@ -414,18 +414,34 @@ class _AttributeMacro(Macro):
     """The ``__attribute__((...))`` macro.
 
     Like the plain empty-expansion macro it erases the attribute from the
-    token stream, but it additionally recognises ``packed`` and flags it
-    on the state so the next struct/union finalize applies ctypes
-    ``_pack_`` (see ``_finalizeBasicType``).  ``__attribute__`` attaches
-    to the immediately neighbouring declaration in both the prefix
-    (``struct __attribute__((packed)) s {...}``) and postfix
-    (``struct s {...} __attribute__((packed))``) forms.
+    token stream, but it additionally:
+
+    * recognises ``packed`` and flags it on the state so the next
+      struct/union finalize applies ctypes ``_pack_`` (see
+      ``_finalizeBasicType``); and
+    * stashes *every* attribute's raw argument text on the state so it
+      can be attached to the declaration's ``attribs`` list (see
+      ``_attachPendingAttribs``).  This is unconditional -- an attribute
+      we interpret (``packed``) is recorded in ``attribs`` too, not
+      instead-of.  So callers can always read back the verbatim
+      attributes (``aligned(16)``, ``mode(TI)``, ...), and interpreting
+      more of them later won't remove them from ``attribs``.
+
+    ``__attribute__`` attaches to the immediately neighbouring
+    declaration in both the prefix (``struct __attribute__((packed))
+    s {...}``) and postfix (``struct s {...} __attribute__((packed))``)
+    forms.
     """
     _packed_re = re.compile(r"\bpacked\b")
 
     def eval(self, state, args):
-        if state is not None and any(self._packed_re.search(a) for a in args):
-            state._pendingPackedAttr = True
+        if state is not None:
+            if any(self._packed_re.search(a) for a in args):
+                state._pendingPackedAttr = True
+            for a in args:
+                text = a.strip()
+                if text:
+                    state._pendingAttribs.append(text)
         return ""
 
 
@@ -873,6 +889,16 @@ class State(object):
         # Set when ``__attribute__((packed))`` is expanded; consumed by
         # the next struct/union finalize (see ``_finalizeBasicType``).
         self._pendingPackedAttr = False
+        # Raw ``__attribute__((...))`` argument texts accumulated since
+        # the last declaration; attached to that declaration's
+        # ``attribs`` list at finalize (see ``_attachPendingAttribs``).
+        # EVERY attribute is recorded here verbatim, whether or not we
+        # also interpret it ourselves -- e.g. ``packed`` still lands in
+        # ``attribs`` in addition to setting ``obj.packed``.  So
+        # ``attribs`` is a complete raw record; adding interpretation of
+        # further attributes later (``aligned`` etc.) will not remove
+        # them from ``attribs``.
+        self._pendingAttribs = []
 
     @classmethod
     def getDictNameForType(cls, objType):
@@ -2582,7 +2608,10 @@ class CTypedef(_CBaseWithOptBody):
             stateStruct.error("internal error: " + str(self) + " finalized twice")
             return
 
-        self.type = make_type_from_typetokens(stateStruct, self, self._type_tokens)
+        # ``self.type`` may already be set by array parsing
+        # (``typedef float V[4];`` -> ``CArrayType``); don't clobber it.
+        if self.type is None:
+            self.type = make_type_from_typetokens(stateStruct, self, self._type_tokens)
         _CBaseWithOptBody.finalize(self, stateStruct)
 
         if self.type is None:
@@ -2950,7 +2979,9 @@ def _finalizeBasicType(obj, stateStruct, dictName=None, listName=None, addToCont
             obj.packed = 1
         else:
             obj.packed = stateStruct._pragmaPackCurrent
-    if isinstance(obj, (CStruct, CUnion)):
+    if isinstance(obj, (CStruct, CUnion, CEnum)):
+        # Prefix form: ``struct __attribute__((...)) S {...}``.
+        _attachPendingAttribs(stateStruct, obj)
         stateStruct._pendingPackedAttr = False
     _CBaseWithOptBody.finalize(obj, stateStruct, addToContent=None)
 
@@ -2958,9 +2989,17 @@ def _finalizeBasicType(obj, stateStruct, dictName=None, listName=None, addToCont
         _addToParent(obj=obj, stateStruct=stateStruct, dictName=dictName, listName=listName, allowPredec=allowPredec)
 
 
+def _attachPendingAttribs(stateStruct, obj):
+    """Move accumulated ``__attribute__((...))`` raw texts onto
+    ``obj.attribs`` (and clear the pending list)."""
+    if obj is not None and stateStruct._pendingAttribs:
+        obj.attribs = list(obj.attribs) + stateStruct._pendingAttribs
+    stateStruct._pendingAttribs = []
+
+
 def _consumePendingPackedAttr(stateStruct, obj):
     """Apply a pending ``__attribute__((packed))`` to a just-defined
-    struct/union.
+    struct/union, and attach any pending raw attribute texts.
 
     Handles the postfix form ``struct {...} __attribute__((packed));``,
     where the attribute is only seen *after* the type already finalized
@@ -2978,6 +3017,7 @@ def _consumePendingPackedAttr(stateStruct, obj):
             and stateStruct._pendingPackedAttr:
         obj.packed = 1
     stateStruct._pendingPackedAttr = False
+    _attachPendingAttribs(stateStruct, obj)
 
 
 class CFunc(_CBaseWithOptBody):
@@ -4582,10 +4622,16 @@ def _parse_struct_or_union_body(stateStruct, curCObj, input_iter):
     # belongs to a member declaration, not this type, so clear it before
     # finalizing so it cannot leak onto the enclosing type.
     pending_at_entry = stateStruct._pendingPackedAttr
+    # Same reasoning for raw attribute texts: keep the ones present at
+    # entry (prefix attributes of THIS type); drop any accumulated during
+    # the body (they belong to member declarations, not the enclosing
+    # type -- attaching them here would be wrong).
+    attribs_at_entry = len(stateStruct._pendingAttribs)
     curCObj.body = CBody(parent=curCObj.parent.body)
     cpre3_parse_body(stateStruct, curCObj, input_iter)
     if not pending_at_entry:
         stateStruct._pendingPackedAttr = False
+    del stateStruct._pendingAttribs[attribs_at_entry:]
     curCObj.finalize(stateStruct)
 
 def cpre3_parse_struct(stateStruct, curCObj, input_iter):
@@ -4835,7 +4881,7 @@ def cpre3_parse_arrayargs(stateStruct, curCObj, input_iter):
     valueStmnt._bracketlevel = curCObj._bracketlevel
     valueStmnt._cpre3_parse_brackets(stateStruct, COpeningBracket("[", brackets=curCObj._bracketlevel), input_iter)
     assert isinstance(valueStmnt._leftexpr, CArrayStatement)
-    if isinstance(curCObj, (CVarDecl, CFuncArgDecl, CFuncPointerDecl)):
+    if isinstance(curCObj, (CVarDecl, CFuncArgDecl, CFuncPointerDecl, CTypedef)):
         arrayLen = valueStmnt._leftexpr
         if isinstance(curCObj.type, CArrayType):
             # Subsequent dimension of a multi-dimensional array, e.g. the
@@ -4938,6 +4984,9 @@ def cpre3_parse_typedef(stateStruct, curCObj, input_iter):
                     typeObj.finalize(stateStruct, addToContent = typeObj.body is not None)
                 # Postfix ``typedef struct {...} __attribute__((packed)) N;``.
                 _consumePendingPackedAttr(stateStruct, typeObj)
+                # Any remaining raw attributes belong to the typedef itself
+                # (e.g. ``typedef float V[4] __attribute__((aligned(16)));``).
+                _attachPendingAttribs(stateStruct, curCObj)
                 curCObj.finalize(stateStruct)
                 return
             else:
