@@ -331,6 +331,51 @@ def test_parse_attribute_texts_preserved():
     assert any("aligned" in a and "16" in a for a in P.attribs)
 
 
+def test_parse_attribute_no_leak_and_member_attribs():
+    # Attributes must attach to their OWN declaration and not leak onto the
+    # following one, for every declaration kind -- and struct members keep
+    # their own attributes.
+
+    def _member(struct, name):
+        for c in struct.body.contentlist:
+            if getattr(c, "name", None) == name:
+                return c
+        raise KeyError(name)
+
+    # Function / variable attributes attach to the func/var, not the next
+    # struct.
+    s = parse("""
+    void f(void) __attribute__((aligned(32)));
+    int v __attribute__((aligned(8)));
+    struct After { int a; };
+    """)
+    assert any("aligned" in a and "32" in a for a in s.funcs["f"].attribs)
+    assert any("aligned" in a and "8" in a for a in s.vars["v"].attribs)
+    assert s.structs["After"].attribs == []
+
+    # A postfix enum attribute (``packed``) must be consumed by the enum,
+    # not leak its ``packed`` flag onto the following struct.
+    s = parse("""
+    enum E { A } __attribute__((packed));
+    struct S2 { char c; int x; };
+    """)
+    assert any("packed" in a for a in s.enums["E"].attribs)
+    assert s.structs["S2"].packed is None
+
+    # Struct members keep their own attributes.
+    s = parse("struct M { int x __attribute__((aligned(8))); int y; };")
+    assert any("aligned" in a and "8" in a for a in _member(s.structs["M"], "x").attribs)
+    assert _member(s.structs["M"], "y").attribs == []
+
+    # A struct PREFIX attribute stays on the struct and is NOT stolen by
+    # its first member.
+    s = parse("struct P { int x; int y; } ;")  # baseline: no attribs
+    assert s.structs["P"].attribs == []
+    s = parse("struct Q __attribute__((aligned(16))) { int x; int y; };")
+    assert any("aligned" in a and "16" in a for a in s.structs["Q"].attribs)
+    assert _member(s.structs["Q"], "x").attribs == []
+
+
 def test_parse_array_typedef():
     # ``typedef T name[N];`` (and multi-dim) -- the array dimension used
     # to be dropped (``CTypedef.finalize`` recomputed the type from the

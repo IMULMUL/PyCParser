@@ -2979,8 +2979,15 @@ def _finalizeBasicType(obj, stateStruct, dictName=None, listName=None, addToCont
             obj.packed = 1
         else:
             obj.packed = stateStruct._pragmaPackCurrent
-    if isinstance(obj, (CStruct, CUnion, CEnum)):
-        # Prefix form: ``struct __attribute__((...)) S {...}``.
+    if isinstance(obj, (CStruct, CUnion, CEnum, CFunc, CVarDecl)):
+        # Consume the attributes belonging to THIS declaration so they
+        # cannot leak onto the next one.  struct/union/enum finalize at
+        # their ``}`` -- this handles the PREFIX form
+        # (``struct __attribute__((...)) S {...}``); their postfix form
+        # is handled at the ``;`` (see ``_consumePendingPackedAttr``).
+        # CFunc / CVarDecl (incl. variables and function pointers)
+        # finalize at the ``;`` AFTER their own postfix attribute, so
+        # this attaches it to them and clears the packed flag.
         _attachPendingAttribs(stateStruct, obj)
         stateStruct._pendingPackedAttr = False
     _CBaseWithOptBody.finalize(obj, stateStruct, addToContent=None)
@@ -2998,23 +3005,24 @@ def _attachPendingAttribs(stateStruct, obj):
 
 
 def _consumePendingPackedAttr(stateStruct, obj):
-    """Apply a pending ``__attribute__((packed))`` to a just-defined
-    struct/union, and attach any pending raw attribute texts.
+    """Consume a pending postfix attribute for a just-defined
+    struct/union/enum, and attach any pending raw attribute texts.
 
-    Handles the postfix form ``struct {...} __attribute__((packed));``,
-    where the attribute is only seen *after* the type already finalized
-    (at its ``}``).  Called at the terminating ``;``.
+    Handles the postfix form ``struct {...} __attribute__((packed));``
+    (and the enum equivalent), where the attribute is only seen *after*
+    the type already finalized (at its ``}``).  Called at the
+    terminating ``;``.
 
-    Only acts when ``obj`` is a struct/union, and only then clears the
-    flag.  This is important: the per-field ``;`` inside a struct body
-    must NOT clear the flag, otherwise the prefix form
+    Only acts when ``obj`` is a struct/union/enum, and only then clears
+    the flag.  This is important: the per-field ``;`` inside a struct
+    body must NOT clear the flag, otherwise the prefix form
     ``struct __attribute__((packed)) s { ... }`` (whose flag is consumed
     at the struct's own finalize) would lose it during field parsing.
     """
-    if not isinstance(obj, (CStruct, CUnion)):
+    if not isinstance(obj, (CStruct, CUnion, CEnum)):
         return
-    if obj.body is not None and obj.packed is None \
-            and stateStruct._pendingPackedAttr:
+    if isinstance(obj, (CStruct, CUnion)) and obj.body is not None \
+            and obj.packed is None and stateStruct._pendingPackedAttr:
         obj.packed = 1
     stateStruct._pendingPackedAttr = False
     _attachPendingAttribs(stateStruct, obj)
@@ -4615,35 +4623,35 @@ class CArrayStatement(CStatement):
     def asCCode(self, indent=""):
         return indent + "[" + CStatement.asCCode(self) + "]"
 
-def _parse_struct_or_union_body(stateStruct, curCObj, input_iter):
-    # Snapshot the pending ``__attribute__((packed))`` flag.  If it was
-    # already set on entry it is a prefix attribute for THIS type and
-    # must survive to ``finalize``.  If it gets set during the body it
-    # belongs to a member declaration, not this type, so clear it before
-    # finalizing so it cannot leak onto the enclosing type.
-    pending_at_entry = stateStruct._pendingPackedAttr
-    # Same reasoning for raw attribute texts: keep the ones present at
-    # entry (prefix attributes of THIS type); drop any accumulated during
-    # the body (they belong to member declarations, not the enclosing
-    # type -- attaching them here would be wrong).
-    attribs_at_entry = len(stateStruct._pendingAttribs)
+def _parse_isolated_body(stateStruct, curCObj, input_iter):
+    """Parse a ``{...}`` body, isolating the pending-attribute state.
+
+    THIS declaration's own (prefix) ``__attribute__`` state -- the
+    pending raw-attribute list and packed flag -- is hidden while the
+    body is parsed, so member declarations consume only their *own*
+    attributes (and don't inherit ours).  It is restored afterwards so
+    this declaration's finalize still sees its prefix attributes.
+    """
+    saved_attribs = stateStruct._pendingAttribs
+    saved_packed = stateStruct._pendingPackedAttr
+    stateStruct._pendingAttribs = []
+    stateStruct._pendingPackedAttr = False
     curCObj.body = CBody(parent=curCObj.parent.body)
     cpre3_parse_body(stateStruct, curCObj, input_iter)
-    if not pending_at_entry:
-        stateStruct._pendingPackedAttr = False
-    del stateStruct._pendingAttribs[attribs_at_entry:]
+    # Anything left pending here belonged to a member that didn't consume
+    # it; drop it.  Restore this declaration's own prefix attributes.
+    stateStruct._pendingAttribs = saved_attribs
+    stateStruct._pendingPackedAttr = saved_packed
     curCObj.finalize(stateStruct)
 
 def cpre3_parse_struct(stateStruct, curCObj, input_iter):
-    _parse_struct_or_union_body(stateStruct, curCObj, input_iter)
+    _parse_isolated_body(stateStruct, curCObj, input_iter)
 
 def cpre3_parse_union(stateStruct, curCObj, input_iter):
-    _parse_struct_or_union_body(stateStruct, curCObj, input_iter)
+    _parse_isolated_body(stateStruct, curCObj, input_iter)
 
 def cpre3_parse_funcbody(stateStruct, curCObj, input_iter):
-    curCObj.body = CBody(parent=curCObj.parent.body)
-    cpre3_parse_body(stateStruct, curCObj, input_iter)
-    curCObj.finalize(stateStruct)
+    _parse_isolated_body(stateStruct, curCObj, input_iter)
 
 def cpre3_parse_funcpointername(stateStruct, curCObj, input_iter):
     bracketLevel = list(curCObj._bracketlevel)
