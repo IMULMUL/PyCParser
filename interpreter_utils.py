@@ -18,21 +18,13 @@ def _ast_bin_op_to_ast_expression(op):
     if inspect.isclass(op):
         op = op()
     assert isinstance(op, ast.operator)
-    l = ast.Lambda()
-    a = l.args = ast.arguments()
-    a.args = [_arg_name("a"), _arg_name("b")]
-    a.vararg = None
-    a.kwarg = None
-    a.defaults = []
-    if sys.version_info[0] >= 3:
-        a.kwonlyargs = []
-        a.kw_defaults = []
-    if sys.version_info >= (3, 8):
-        a.posonlyargs = []
-    t = l.body = ast.BinOp()
-    t.left = ast.Name(id="a", ctx=ast.Load())
-    t.right = ast.Name(id="b", ctx=ast.Load())
-    t.op = op
+    args = ast.arguments(
+        posonlyargs=[], args=[_arg_name("a"), _arg_name("b")],
+        vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[])
+    body = ast.BinOp(
+        left=ast.Name(id="a", ctx=ast.Load()), op=op,
+        right=ast.Name(id="b", ctx=ast.Load()))
+    l = ast.Lambda(args=args, body=body)
     expr = ast.Expression(body=l)
     return expr
 

@@ -3,6 +3,7 @@
 # code under BSD 2-Clause License
 
 import ctypes
+import types
 from . import cparser
 from .cparser_utils import *
 
@@ -19,10 +20,7 @@ class CStateDictWrapper:
     def __setitem__(self, k, v):
         assert False, "read-only in C wrapped state"
     def __getitem__(self, k):
-        found = []
-        for d in self._dicts:
-            try: found += [d[k]]
-            except KeyError: pass
+        found = [d[k] for d in self._dicts if k in d]
         for f in found:
             # prefer items with body set.
             if hasattr(f, "body") and f.body is not None: return f
@@ -37,8 +35,6 @@ class CStateDictWrapper:
     def get(self, k, default = None):
         try: return self.__getitem__(k)
         except KeyError: return default
-    def has_key(self, k):
-        return self.__contains__(k)
     def __repr__(self): return "CStateDictWrapper(" + repr(self._dicts) + ")"
     def __str__(self): return "CStateDictWrapper(" + str(self._dicts) + ")"
 
@@ -50,21 +46,29 @@ class CStateWrapper:
     """
 
     WrappedDicts = ("macros","typedefs","structs","unions","enums","funcs","vars","enumconsts")
-    LocalAttribs = ("_cwrapper")
+    LocalAttribs = ("_cwrapper",)
     def __init__(self, cwrapper):
         self._cwrapper = cwrapper
     def __getattr__(self, k):
         if k in self.LocalAttribs: raise AttributeError # normally we shouldn't get here but just in case
         if k == "_errors": return getattr(self._cwrapper, k) # fallthrough to CWrapper to collect all errors there
         if k in self.WrappedDicts:
-            return CStateDictWrapper(dicts = map(lambda s: getattr(s, k), self._cwrapper.stateStructs))
+            # NOTE: deliberately a lazy map() iterator, NOT a list.  The
+            # iterator is exhausted after the wrapper's first lookup, so a
+            # stored CStateDictWrapper effectively becomes empty.  That
+            # sounds like a bug, but PyCPython's interpretation phase
+            # depends on this: materializing the dicts here sends the
+            # Py_Main translation into a practically endless loop
+            # (>400s vs ~60s).  Root cause of that dependency is not yet
+            # understood -- if you change this, verify cpython.py still
+            # runs end-to-end.
+            return CStateDictWrapper(dicts=map(lambda s: getattr(s, k), self._cwrapper.stateStructs))
 
         # fallback to first stateStruct
         if len(self._cwrapper.stateStructs) == 0:
             raise AttributeError("CStateWrapper " + str(self) + " doesn't have any state structs set yet")
         stateStruct = self._cwrapper.stateStructs[0]
         attr = getattr(stateStruct, k)
-        import types
         if isinstance(attr, types.MethodType):
             attr = rebound_instance_method(attr, self)
         return attr
@@ -78,7 +82,7 @@ class CStateWrapper:
 
 
 def _castArg(value):
-    if isinstance(value, (str,unicode)):
+    if isinstance(value, str):
         return ctypes.cast(ctypes.c_char_p(value), ctypes.POINTER(ctypes.c_byte))
     return value
 

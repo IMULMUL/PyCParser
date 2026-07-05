@@ -13,8 +13,6 @@ import typing
 if typing.TYPE_CHECKING:
     from . import interpreter
 
-PY2 = sys.version_info[0] == 2
-PY3 = sys.version_info[0] >= 3
 
 libc = ctypes.CDLL(None)
 
@@ -63,14 +61,14 @@ def wrapCFunc_varargs(state, funcname, wrap_funcname):
         returnType=wrap_func.returnType, argTypes=wrap_func.argTypes)
 
 
+def _int_val(x):
+    """Coerce a wrapped ctypes int (or plain int) to a Python int."""
+    return x.value if hasattr(x, "value") else int(x)
+
+
 def _fixCArg(a):
-    if PY2 and isinstance(a, unicode):
-        a = a.encode("utf-8")
     if isinstance(a, str):
-        if PY2:
-            a = ctypes.c_char_p(a)
-        else:
-            a = ctypes.c_char_p(a.encode("utf8"))
+        a = ctypes.c_char_p(a.encode("utf8"))
     if isinstance(a, ctypes.c_char_p) or (isinstance(a, _ctypes._Pointer) and a._type_ is ctypes.c_char):
         return ctypes.cast(a, ctypes.POINTER(ctypes.c_byte))
     if isinstance(a, ctypes.c_char):
@@ -356,7 +354,7 @@ class Wrapper:
             if info is not None:
                 try:
                     info["scandir"].close()
-                except Exception:
+                except OSError:
                     pass
             return ctypes.c_int(0)
 
@@ -777,7 +775,7 @@ class Wrapper:
 
     def handle_assert_h(self, state):
         def assert_wrap(x):
-            if isinstance(x, (int, long)):
+            if isinstance(x, int):
                 val = x
             else:
                 if isinstance(x, (ctypes._Pointer, ctypes.Array, ctypes._CFuncPtr)):
@@ -817,11 +815,11 @@ class Wrapper:
         _libc_fcntl = libc.fcntl
         _libc_fcntl.restype = ctypes.c_int
         def _fcntl_wrapper(fd, cmd, *extra):
-            fd_v = fd.value if hasattr(fd, 'value') else int(fd)
-            cmd_v = cmd.value if hasattr(cmd, 'value') else int(cmd)
+            fd_v = _int_val(fd)
+            cmd_v = _int_val(cmd)
             if extra:
                 arg = extra[0]
-                arg_v = arg.value if hasattr(arg, 'value') else int(arg)
+                arg_v = _int_val(arg)
                 return ctypes.c_int(_libc_fcntl(fd_v, cmd_v, arg_v))
             return ctypes.c_int(_libc_fcntl(fd_v, cmd_v))
         state.funcs["fcntl"] = CWrapValue(
@@ -958,7 +956,7 @@ class Wrapper:
         state.typedefs["nl_item"] = CTypedef(name="nl_item", type=CBuiltinType(("int",)))
 
         def _nl_langinfo(item):
-            item_v = item.value if hasattr(item, "value") else int(item)
+            item_v = _int_val(item)
             s = _locale.nl_langinfo(item_v)
             if isinstance(s, str):
                 s = s.encode("utf-8")
@@ -1012,7 +1010,7 @@ class Wrapper:
             return ctypes.c_int(0)
 
         def _fstat(fd, st_ptr):
-            fd_v = fd.value if hasattr(fd, "value") else int(fd)
+            fd_v = _int_val(fd)
             try:
                 st_res = os.fstat(fd_v)
             except OSError:

@@ -13,15 +13,12 @@
 #  when opening a new file, macro-dependencies, check the last change time
 #     of all files and if everything matches, use the cache.
 
-import sys
-import os, os.path
-if sys.version_info.major == 2:
-    import cparser
-    from cparser_utils import *
-else:
-    from . import cparser
-    from .cparser_utils import *
+import os
+import os.path
 import types
+
+from . import cparser
+from .cparser_utils import *
 
 # Note: It might make sense to make this somehow configureable.
 # However, for now, I'd like to keep things as simple as possible.
@@ -41,15 +38,10 @@ CACHING_DIR = os.path.expanduser("~/.cparser_caching/")
 def sha1(obj):
     import hashlib
     h = hashlib.sha1()
-    if sys.version_info.major == 2:
-        def h_update(s): h.update(s)
-    else:
-        def h_update(s):
-            if isinstance(s, str): h.update(s.encode("utf-8"))
-            else: h.update(s)
-    if isinstance(obj, unicode):
-        h_update(obj.encode("utf-8"))
-    elif isinstance(obj, str):
+    def h_update(s):
+        if isinstance(s, str): h.update(s.encode("utf-8"))
+        else: h.update(s)
+    if isinstance(obj, str):
         h_update(obj)
     elif isinstance(obj, dict):
         h_update("{")
@@ -61,7 +53,7 @@ def sha1(obj):
         h_update("}")
     elif isinstance(obj, (list,tuple)):
         h_update("[")
-        for v in sorted(obj):
+        for v in obj:
             h_update(sha1(v))
             h_update(",")
         h_update("]")
@@ -71,7 +63,7 @@ def sha1(obj):
 
 class MyDict(dict):
     def __setattr__(self, key, value):
-        assert isinstance(key, (str,unicode))
+        assert isinstance(key, str)
         self[key] = value
     def __getattr__(self, key):
         try: return self[key]
@@ -88,8 +80,8 @@ class DbObj:
     @classmethod
     def Load(cls, key, create=False):
         fn = cls.GetFilePath(key)
-        try: f = open(fn, "b")
-        except:
+        try: f = open(fn, "rb")
+        except OSError:
             if create:
                 obj = cls()
                 obj.__dict__["_key"] = key
@@ -107,8 +99,7 @@ class DbObj:
     def delete(self): self.Delete(self._key)
     def save(self):
         fn = self.GetFilePath(self._key)
-        try: os.makedirs(os.path.dirname(fn))
-        except: pass # ignore file-exists or other errors
+        os.makedirs(os.path.dirname(fn), exist_ok=True)
         f = open(fn, "wb")
         import pickle
         pickle.dump(self, f)
@@ -122,7 +113,7 @@ class FileCacheRef(MyDict):
     @classmethod
     def FromCacheData(cls, cache_data):
         ref = cls()
-        ref.filedepslist = map(lambda fn: (fn,getLastChangeUnixTime(fn)), cache_data.filenames)
+        ref.filedepslist = [(fn, getLastChangeUnixTime(fn)) for fn in sorted(cache_data.filenames)]
         ref.macros = {}
         for m in cache_data.macroAccessSet:
             ref.macros[m] = cache_data.oldMacros[m]
@@ -210,7 +201,7 @@ def State__cached_preprocess(stateStruct, reader, full_filename, filename):
             print("(Safe to ignore) Error while reading C parser cache for %s : %s" % (filename, str(e)))
             # Try to delete old references if possible. Otherwise we might always hit this.
             try: FileCacheRefs.Delete(full_filename)
-            except: pass
+            except OSError: pass
 
     assert isinstance(stateStruct, StateWrapper)
     stateStruct.cache_pushLevel()

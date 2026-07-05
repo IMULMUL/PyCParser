@@ -1,34 +1,15 @@
 import types
-import sys
 import keyword
 
 
-if sys.version_info.major == 2:
-    def rebound_instance_method(f, newobj):
-        # noinspection PyArgumentList
-        return types.MethodType(f.im_func, newobj, newobj.__class__)
-else:
-    def rebound_instance_method(f, newobj):
-        return lambda *args, **kwargs: f.__func__(newobj, *args, **kwargs)
+def rebound_instance_method(f, newobj):
+    """Rebind bound method *f* onto *newobj*."""
+    return lambda *args, **kwargs: f.__func__(newobj, *args, **kwargs)
 
-if sys.version_info.major == 2:
-    def generic_class_method(f):
-        return f.im_func
-else:
-    def generic_class_method(f):
-        return f
 
-if sys.version_info.major >= 3:
-    unicode = str
-    long = int
-    unichr = chr
-else:
-    # noinspection PyUnresolvedReferences
-    unicode = __builtins__["unicode"]
-    # noinspection PyUnresolvedReferences
-    long = __builtins__["long"]
-    # noinspection PyUnresolvedReferences
-    unichr = __builtins__["unichr"]
+def generic_class_method(f):
+    """The plain function behind a method (no-op on Python 3)."""
+    return f
 
 
 # Python object class-level attrs (``__doc__``, ``__class__``,

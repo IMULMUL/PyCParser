@@ -8,8 +8,7 @@ from __future__ import print_function
 import sys
 import ast
 import os
-import six
-from .cparser_utils import unicode
+import io
 
 # Large float and imaginary literals get turned into infinities in the AST.
 # We unparse those infinities to INFSTR.
@@ -338,7 +337,7 @@ class Unparser:
             self.write(repr(tree.s))
         elif isinstance(tree.s, str):
             self.write("b" + repr(tree.s))
-        elif isinstance(tree.s, unicode):
+        elif isinstance(tree.s, str):
             self.write(repr(tree.s).lstrip("u"))
         else:
             assert False, "shouldn't get here"
@@ -465,7 +464,7 @@ class Unparser:
         # a 32-bit machine (the first is an int, the second a long), and
         # -7j is different from -(7j).  (The first has real part 0.0, the second
         # has real part -0.0.)
-        if isinstance(t.op, ast.USub) and isinstance(t.operand, ast.Num):
+        if isinstance(t.op, ast.USub) and isinstance(t.operand, ast.Constant) and isinstance(t.operand.value, (int, float, complex)):
             self.write("(")
             self.dispatch(t.operand)
             self.write(")")
@@ -505,7 +504,7 @@ class Unparser:
         # Special case: 3.__abs__() is a syntax error, so if t.value
         # is an integer literal then we need to either parenthesize
         # it or add an extra space to get 3 .__abs__().
-        if isinstance(t.value, ast.Num) and isinstance(t.value.n, int):
+        if isinstance(t.value, ast.Constant) and isinstance(t.value.value, int) and not isinstance(t.value.value, bool):
             self.write(" ")
         self.write(".")
         self.write(t.attr)
@@ -536,6 +535,10 @@ class Unparser:
             self.write("**")
             self.dispatch(t.kwargs)
         self.write(")")
+
+    def _Starred(self, t):
+        self.write("*")
+        self.dispatch(t.value)
 
     def _Subscript(self, t):
         self.dispatch(t.value)
@@ -635,7 +638,7 @@ def testdir(a):
         for n in names:
             fullname = os.path.join(a, n)
             if os.path.isfile(fullname):
-                output = six.StringIO()
+                output = io.StringIO()
                 print('Testing %s' % fullname)
                 try:
                     roundtrip(fullname, output)

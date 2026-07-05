@@ -6,14 +6,14 @@ by Albert Zeyer, 2011
 code under BSD 2-Clause License
 """
 
-from __future__ import print_function
 import typing
 import ctypes
 import _ctypes
+import copy
 import os
 import re
 from inspect import isclass
-from .cparser_utils import unicode, long, unichr, py_safe_identifier
+from .cparser_utils import py_safe_identifier
 
 if typing.TYPE_CHECKING:
     from . import globalincludewrappers
@@ -26,6 +26,8 @@ OpChars = "&|=!+-*/%<>^~?:,."
 LongOps = [c+"=" for c in  "&|=+-*/%<>^~!"] + ["--","++","->","<<",">>","&&","||","<<=",">>=","::",".*","->*"]
 OpeningBrackets = "[({"
 ClosingBrackets = "})]"
+# open -> matching close; avoids index arithmetic per closing bracket.
+_BracketMatch = {"(": ")", "[": "]", "{": "}"}
 # Pre-concatenated character classes used in tokenizer hot paths.
 # Inline ``SpaceChars + "\n"`` etc. in ``cpre2_parse`` would
 # reallocate per-character (~13M times for CPython); precomputing
@@ -36,6 +38,7 @@ ClosingBrackets = "})]"
 _WhitespaceChars = SpaceChars + "\n"
 _IdStartChars = LetterChars + "_"
 _IdContChars = NumberChars + LetterChars + "_"
+_SpaceOrIdStartChars = SpaceChars + LetterChars + "_"
 _LongOpsSet = frozenset(LongOps)
 
 # NOTE: most of the C++ stuff is not really supported yet
@@ -254,7 +257,7 @@ def parse_macro_def_rightside(stateStruct, argnames, input):
         for c in input:
             if state == 0:
                 if c in SpaceChars: ret += c
-                elif c in LetterChars + "_":
+                elif c in _IdStartChars:
                     state = 1
                     lastidentifier = c
                 elif c in NumberChars:
@@ -266,7 +269,7 @@ def parse_macro_def_rightside(stateStruct, argnames, input):
                 elif c == "#": state = 6
                 else: ret += c
             elif state == 1: # identifier
-                if c in LetterChars + NumberChars + "_":
+                if c in _IdContChars:
                     lastidentifier += c
                 elif c == "#":
                     if lastidentifier in args:
@@ -287,11 +290,11 @@ def parse_macro_def_rightside(stateStruct, argnames, input):
                 ret += c
                 if c in NumberChars: pass
                 elif c == "x": state = 3
-                elif c in LetterChars + "_": pass # even if invalid, stay in this state
+                elif c in _IdStartChars: pass # even if invalid, stay in this state
                 else: state = 0
             elif state == 3: # hex number
                 ret += c
-                if c in NumberChars + LetterChars + "_": pass # also ignore invalids
+                if c in _IdContChars: pass # also ignore invalids
                 else: state = 0
             elif state == 4: # str
                 ret += c
@@ -302,7 +305,7 @@ def parse_macro_def_rightside(stateStruct, argnames, input):
                 state = 4
                 ret += simple_escape_char(c)
             elif state == 6: # after "#"
-                if c in SpaceChars + LetterChars + "_":
+                if c in _SpaceOrIdStartChars:
                     lastidentifier = c.strip()
                     state = 7
                 elif c == "#":
@@ -313,7 +316,7 @@ def parse_macro_def_rightside(stateStruct, argnames, input):
                     stateStruct.error("unfold macro: unexpected char '" + c + "' after #")
                     state = 0
             elif state == 7: # after single "#"	with identifier
-                if c in LetterChars + NumberChars + "_":
+                if c in _IdContChars:
                     lastidentifier += c
                 else:
                     if lastidentifier not in args:
@@ -334,7 +337,7 @@ def parse_macro_def_rightside(stateStruct, argnames, input):
                     stateStruct.error("unfold macro: unexpected char %r after in state %i" % (c, state))
                     state = 0  # recover
             elif state == 10: # after identifier + "##"
-                if c in LetterChars + "_":
+                if c in _IdStartChars:
                     lastidentifier = c
                     state = 1
                 else:
@@ -362,6 +365,8 @@ class Macro(object):
         self.rightside = rightside if (rightside is not None) else ""
         self.defPos = state.curPosAsStr() if state else "<unknown>"
         self._tokens = None
+        self._evalFunc = None
+        self._evalFuncState = None
     def __str__(self):
         if self.args is not None:
             return "(" + ", ".join(self.args) + ") -> " + self.rightside
@@ -371,8 +376,16 @@ class Macro(object):
         return "<Macro: " + str(self) + ">"
     def eval(self, state, args):
         if len(args) != len(self.args or ()): raise TypeError("invalid number of args (" + str(args) + ") for " + repr(self))
-        func = parse_macro_def_rightside(state, self.args, self.rightside)
-        return func(*args)
+        # ``parse_macro_def_rightside`` runs a char-by-char state machine
+        # over ``rightside`` -- rebuilding that on every expansion is one
+        # of the hottest allocation sites when parsing large sources.
+        # Cache the compiled expansion closure; it only depends on
+        # ``args``/``rightside`` (both fixed) plus ``state``, which is
+        # captured solely for error reporting -- rebuild if that differs.
+        if self._evalFunc is None or self._evalFuncState is not state:
+            self._evalFunc = parse_macro_def_rightside(state, self.args, self.rightside)
+            self._evalFuncState = state
+        return self._evalFunc(*args)
     def __call__(self, *args):
         return self.eval(None, args)
     def __eq__(self, other):
@@ -487,8 +500,7 @@ class CPointerType(CType):
     def getCType(self, stateStruct):
         try:
             target = self.pointerOf
-            while isinstance(target, CTypedef):
-                target = target.type
+            target = resolveTypedef(target)
             if isinstance(target, CFunc):
                 return target.getCType(stateStruct)
             
@@ -613,7 +625,7 @@ def _getCType(t, stateStruct):
             if t.__name__.startswith("wrapCTypeClass_"):
                 return t.__bases__[0]
             return t
-    except Exception: pass # e.g. typeerror or so
+    except TypeError: pass # t is not a class
     if isinstance(t, (CStruct,CUnion,CEnum)):
         if t.body is None:
             # it probably is the pre-declaration. but we might find the real-one
@@ -661,7 +673,7 @@ def isType(t):
         return t.isCType()
     try:
         if issubclass(t, _ctypes._SimpleCData): return True
-    except Exception: pass # e.g. typeerror or so
+    except TypeError: pass # t is not a class
     if isinstance(t, (CStruct,CUnion,CEnum,CTypedef)): return True
     # ``CFuncPointerDecl`` is a function-pointer type-name (e.g.
     # ``int (*)(int)`` after parser normalisation -- see
@@ -978,7 +990,6 @@ class State(object):
             dir = ""
             if filename[0] != "/":
                 if self._preprocessIncludeLevel and self._preprocessIncludeLevel[-1][0]:
-                    import os.path
                     dir = os.path.dirname(self._preprocessIncludeLevel[-1][0])
                 if not dir: dir = "."
                 dir += "/"
@@ -1061,17 +1072,11 @@ class State(object):
     def depth(self): return 0
 
 
+_valid_defname_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 def is_valid_defname(defname):
-    if not defname: return False
-    gotValidPrefix = False
-    for c in defname:
-        if c in LetterChars + "_":
-            gotValidPrefix = True
-        elif c in NumberChars:
-            if not gotValidPrefix: return False
-        else:
-            return False
-    return True
+    """Whether *defname* is a valid C macro/identifier name."""
+    return bool(_valid_defname_re.fullmatch(defname))
 
 
 def cpreprocess_evaluate_ifdef(state, arg):
@@ -1089,8 +1094,6 @@ def cpreprocess_evaluate_single(state, arg):
     # before trying numeric conversion so that e.g. `0xFFu` or `100UL` parse correctly.
     stripped = arg.rstrip("uUlL")
     try: return int(stripped) # is integer?
-    except ValueError: pass
-    try: return long(stripped) # is long?
     except ValueError: pass
     try: return int(stripped, 16) # is hex (0x…)?
     except ValueError: pass
@@ -1205,7 +1208,7 @@ def cpreprocess_evaluate_cond(stateStruct, condstr):
                     laststr = c
                     state = 6
             elif state == 6: # chars after "defined"
-                if c in LetterChars + "_" + NumberChars:
+                if c in _IdContChars:
                     laststr += c
                 else:
                     macroname = laststr
@@ -1216,7 +1219,6 @@ def cpreprocess_evaluate_cond(stateStruct, condstr):
                     if prefixOp is not None:
                         neweval = prefixOp(neweval)
                         prefixOp = None
-                    oldlast = lasteval
                     if op is not None: lasteval = op(lasteval, neweval)
                     else: lasteval = neweval
                     opstr = ""
@@ -1280,10 +1282,8 @@ def cpreprocess_evaluate_cond(stateStruct, condstr):
                     if prefixOp is not None:
                         neweval = prefixOp(neweval)
                         prefixOp = None
-                    oldlast = lasteval
                     if op is not None: lasteval = op(lasteval, neweval)
                     else: lasteval = neweval
-                    #print "after ):", laststr, args, neweval, op.func_code.co_firstlineno if op else "no-op", oldlast, "->", lasteval
                     laststr = ""
                     opstr = ""
                     state = 18
@@ -1374,7 +1374,11 @@ def cpreprocess_evaluate_cond(stateStruct, condstr):
                                 j += 1
                         elif opstr in OpPrefixFuncs:
                             newprefixop = OpPrefixFuncs[opstr]
-                            if prefixOp: prefixOp = lambda x: prefixOp(newprefixop(x))
+                            if prefixOp:
+                                # Bind via default args -- a plain lambda would
+                                # capture the VARIABLE prefixOp (itself after this
+                                # assignment) and recurse forever on invocation.
+                                prefixOp = lambda x, _p=prefixOp, _n=newprefixop: _p(_n(x))
                             else: prefixOp = newprefixop
                         else:
                             stateStruct.error("invalid op '" + opstr + "' with '" + c + "' following in '" + condstr + "'")
@@ -1437,7 +1441,6 @@ def cpreprocess_evaluate_cond(stateStruct, condstr):
         if prefixOp is not None:
             neweval = prefixOp(neweval)
             prefixOp = None
-        oldlast = lasteval
         if op is not None: lasteval = op(lasteval, neweval)
         else: lasteval = neweval
     elif state == 18: # expected op
@@ -1560,24 +1563,24 @@ def handle_cpreprocess_cmd(state, cmd, arg):
 
     if cmd == "ifdef":
         state._preprocessIfLevels += [0]
-        if any(map(lambda x: x != 1, state._preprocessIfLevels[:-1])): return # we don't really care
+        if any(x != 1 for x in state._preprocessIfLevels[:-1]): return # we don't really care
         check = cpreprocess_evaluate_ifdef(state, arg)
         if check: state._preprocessIfLevels[-1] = 1
 
     elif cmd == "ifndef":
         state._preprocessIfLevels += [0]
-        if any(map(lambda x: x != 1, state._preprocessIfLevels[:-1])): return # we don't really care
+        if any(x != 1 for x in state._preprocessIfLevels[:-1]): return # we don't really care
         check = not cpreprocess_evaluate_ifdef(state, arg)
         if check: state._preprocessIfLevels[-1] = 1
 
     elif cmd == "if":
         state._preprocessIfLevels += [0]
-        if any(map(lambda x: x != 1, state._preprocessIfLevels[:-1])): return # we don't really care
+        if any(x != 1 for x in state._preprocessIfLevels[:-1]): return # we don't really care
         check = cpreprocess_evaluate_cond(state, arg)
         if check: state._preprocessIfLevels[-1] = 1
 
     elif cmd == "elif":
-        if any(map(lambda x: x != 1, state._preprocessIfLevels[:-1])): return # we don't really care
+        if any(x != 1 for x in state._preprocessIfLevels[:-1]): return # we don't really care
         if len(state._preprocessIfLevels) == 0:
             state.error("preprocessor: elif without if")
             return
@@ -1588,7 +1591,7 @@ def handle_cpreprocess_cmd(state, cmd, arg):
             if check: state._preprocessIfLevels[-1] = 1
 
     elif cmd == "else":
-        if any(map(lambda x: x != 1, state._preprocessIfLevels[:-1])): return # we don't really care
+        if any(x != 1 for x in state._preprocessIfLevels[:-1]): return # we don't really care
         if len(state._preprocessIfLevels) == 0:
             state.error("preprocessor: else without if")
             return
@@ -1631,7 +1634,7 @@ def handle_cpreprocess_cmd(state, cmd, arg):
         if state._preprocessIgnoreCurrent: return # we don't really care
         state.error("preprocessor command " + cmd + " unknown")
 
-    state._preprocessIgnoreCurrent = any(map(lambda x: x != 1, state._preprocessIfLevels))
+    state._preprocessIgnoreCurrent = any(x != 1 for x in state._preprocessIfLevels)
 
 
 def cpreprocess_parse(stateStruct, input):
@@ -1818,7 +1821,7 @@ class CFuncName(CStr):
 
 class CChar(_CBase):
     def __init__(self, content=None, rawstr=None, **kwargs):
-        if isinstance(content, (unicode,str)): content = ord(content)
+        if isinstance(content, str): content = ord(content)
         assert isinstance(content, int), "CChar expects int, got " + repr(content)
         assert 0 <= content <= 255, "CChar expects number in range 0-255, got " + str(content)
         _CBase.__init__(self, content, rawstr, **kwargs)
@@ -1878,14 +1881,14 @@ def cpre2_parse_number(stateStruct, s):
     if len(s) > 1 and s[0] == "0" and s[1] in NumberChars:
         try:
             s = s.rstrip("ULul")
-            return long(s, 8)
+            return int(s, 8)
         except Exception as e:
             stateStruct.error("cpre2_parse_number: " + s + " looks like octal but got error " + str(e))
             return 0
     if len(s) > 1 and s[0] == "0" and s[1] in "xX":
         try:
             s = s.rstrip("ULul")
-            return long(s, 16)
+            return int(s, 16)
         except Exception as e:
             stateStruct.error("cpre2_parse_number: " + s + " looks like hex but got error " + str(e))
             return 0
@@ -1893,7 +1896,7 @@ def cpre2_parse_number(stateStruct, s):
         s_stripped = s.rstrip("ULulfF")
         if 'e' in s_stripped.lower() or '.' in s_stripped:
             return float(s_stripped)
-        return long(s_stripped)
+        return int(s_stripped)
     except Exception as e:
         stateStruct.error("cpre2_parse_number: " + s + " cannot be parsed: " + str(e))
         return 0
@@ -2053,7 +2056,7 @@ def cpre2_parse(stateStruct, input, brackets=None):
                     yield COpeningBracket(c, brackets=list(brackets))
                     brackets.append(c)
                 elif c in ClosingBrackets:
-                    if len(brackets) == 0 or ClosingBrackets[len(OpeningBrackets) - OpeningBrackets.index(brackets[-1]) - 1] != c:
+                    if len(brackets) == 0 or _BracketMatch[brackets[-1]] != c:
                         stateStruct.error("cpre2 parse: got '" + c + "' but bracket level was " + str(brackets))
                     else:
                         brackets[:] = brackets[:-1]
@@ -2165,10 +2168,7 @@ def cpre2_parse(stateStruct, input, brackets=None):
                 state = 22
             elif state == 27: # wchar 'char' (L'...')
                 if c == "'":
-                    if len(laststr) == 1:
-                        yield CChar(laststr)
-                    else:
-                        yield CChar(laststr)
+                    yield CChar(laststr)
                     laststr = ""
                     state = 0
                 elif c == "\\": state = 28
@@ -2371,7 +2371,7 @@ def make_type_from_typetokens(stateStruct, curCObj, type_tokens):
     elif len(type_tokens) > 1 and type_tokens[-1] == "*":
         t = CPointerType(make_type_from_typetokens(stateStruct, curCObj, type_tokens[:-1]))
     elif len(type_tokens) == 1:
-        if not isinstance(type_tokens[0], (str, unicode)):
+        if not isinstance(type_tokens[0], str):
             stateStruct.error("type token is not expected str but %r" % (type_tokens[0],))
             t = None
         else:
@@ -2410,19 +2410,29 @@ class _CBaseWithOptBody(object):
         ("defPos", None, "@", str),
     ]
 
+    # Rarely-read immutable-scalar defaults live on the class: instances
+    # only pay for them when actually assigned.  This matters -- ~1M of
+    # these objects are constructed when parsing CPython's source, and
+    # __init__ is one of the hottest spots in the profile.  Frequently
+    # *read* attributes (name/type/body/parent -- read hot in namespace
+    # lookups while often staying None) stay per-instance: a mixed
+    # instance/class lookup pattern defeats CPython's per-site attribute
+    # caches and makes the readers measurably slower.  The list-valued
+    # attribs MUST stay per-instance (mutated in place via ``+=``).
+    _bracketlevel = None
+    _finalized = False
+    defPos = None
+    value = None
+
     def __init__(self, **kwargs):
         self._type_tokens = []
-        self._bracketlevel = None
-        self._finalized = False
-        self.defPos = None
         self.type = None
-        self.attribs = []
         self.name = None
+        self.body = None
+        self.parent = None
+        self.attribs = []
         self.args = []
         self.arrayargs = []
-        self.body = None
-        self.value = None
-        self.parent = None
         self.designators = []
         if kwargs:
             for k,v in kwargs.items():
@@ -2493,7 +2503,7 @@ class _CBaseWithOptBody(object):
             self.body.contentlist.append(obj)
 
     def _copy(self, value, parent=None, name=None, leave_out_attribs=(), visited=None):
-        if isinstance(value, (int, long, float, str, unicode)) or value is None:
+        if isinstance(value, (int, float, str)) or value is None:
             return value
         elif isinstance(value, type) or callable(value):
             # ``value`` is a class or callable (e.g. ``CVoidType`` as a
@@ -3087,8 +3097,6 @@ def get_cfunctype(restype, *argtypes):
     key = (restype, tuple(argtypes))
     if key in _cfunctype_cache:
         return _cfunctype_cache[key]
-    if _cfunctype_cache: # Only print after initialization to avoid noise
-        pass # print("get_cfunctype", restype, argtypes)
     res = ctypes.CFUNCTYPE(restype, *argtypes)
     _cfunctype_cache[key] = res
     return res
@@ -3429,8 +3437,8 @@ class CEnumConst(_CBaseWithOptBody):
         if self.value is None:
             if self.parent.body.contentlist:
                 last = self.parent.body.contentlist[-1]
-                if isinstance(last.value, (str,unicode)):
-                    self.value = unichr(ord(last.value) + 1)
+                if isinstance(last.value, str):
+                    self.value = chr(ord(last.value) + 1)
                 else:
                     self.value = last.value + 1
             else:
@@ -3623,8 +3631,7 @@ def opsDoLeftToRight(stateStruct, op1, op2, prefix1=False):
 
 
 def isCompleteType(t):
-    while isinstance(t, CTypedef):
-        t = t.type
+    t = resolveTypedef(t)
     if isinstance(t, (CStruct, CUnion, CEnum)):
         return t.body is not None
     if isinstance(t, CArrayType):
@@ -3649,8 +3656,7 @@ def getConstValue(stateStruct, obj):
             return ctypes.sizeof(ctype)
 
         t = obj.base
-        while isinstance(t, CTypedef):
-            t = t.type
+        t = resolveTypedef(t)
         if isinstance(t, (CBuiltinType, CStdIntType)):  # only number types
             assert len(obj.args) == 1
             v = getConstValue(stateStruct, obj.args[0])
@@ -3671,8 +3677,7 @@ def getValueType(stateStruct, obj):
         return obj.type
     if isinstance(obj, CAttribAccessRef):
         base_type = getValueType(stateStruct, obj.base)
-        while isinstance(base_type, CTypedef):
-            base_type = base_type.type
+        base_type = resolveTypedef(base_type)
         assert isinstance(base_type, (CStruct,CUnion))
         attrib = base_type.findAttrib(stateStruct, obj.name)
         if attrib is None:
@@ -3681,12 +3686,10 @@ def getValueType(stateStruct, obj):
         return attrib.type
     if isinstance(obj, CPtrAccessRef):
         pbase_type = getValueType(stateStruct, obj.base)
-        while isinstance(pbase_type, CTypedef):
-            pbase_type = pbase_type.type
+        pbase_type = resolveTypedef(pbase_type)
         assert isinstance(pbase_type, CPointerType)
         base_type = pbase_type.pointerOf
-        while isinstance(base_type, CTypedef):
-            base_type = base_type.type
+        base_type = resolveTypedef(base_type)
         assert isinstance(base_type, (CStruct,CUnion))
         attrib = base_type.findAttrib(stateStruct, obj.name)
         if attrib is None:
@@ -3695,8 +3698,7 @@ def getValueType(stateStruct, obj):
         return attrib.type
     if isinstance(obj, CArrayIndexRef):
         t = getValueType(stateStruct, obj.base)
-        while isinstance(t, CTypedef):
-            t = t.type
+        t = resolveTypedef(t)
         if isinstance(t, CArrayType):
             return t.arrayOf
         elif isinstance(t, CPointerType):
@@ -3709,8 +3711,7 @@ def getValueType(stateStruct, obj):
         if isinstance(obj.base, (CTypedef, CType)):
             return obj.base
         base_type = getValueType(stateStruct, obj.base)
-        while isinstance(base_type, CTypedef):
-            base_type = base_type.type
+        base_type = resolveTypedef(base_type)
         assert isinstance(base_type, (CFuncPointerDecl,CFunc))
         return base_type.type  # return-type
     if isinstance(obj, CFunc):
@@ -3739,10 +3740,8 @@ def getValueType(stateStruct, obj):
 
 
 def getCommonValueType(stateStruct, t1, t2):
-    while isinstance(t1, CTypedef):
-        t1 = t1.type
-    while isinstance(t2, CTypedef):
-        t2 = t2.type
+    t1 = resolveTypedef(t1)
+    t2 = resolveTypedef(t2)
     # ``getValueType`` for ``CSizeofSymbol`` / ``COffsetofSymbol``
     # returns a synthetic ``CFunc(type=size_t)``.  Unwrap to the
     # return type so arithmetic between a pointer and ``sizeof(...)``
@@ -3773,11 +3772,8 @@ def getCommonValueType(stateStruct, t1, t2):
         return getCommonValueType(stateStruct, t2, t1)
     if isinstance(t1, CPointerType):
         if isinstance(t2, CPointerType):
-            if not isSameType(stateStruct, t1.pointerOf, t2.pointerOf):
-                import sys as _sys
-                print("[debug getCommonValueType pointers differ] t1.pointerOf=%r t2.pointerOf=%r"
-                      % (t1.pointerOf, t2.pointerOf), file=_sys.stderr)
-            assert isSameType(stateStruct, t1.pointerOf, t2.pointerOf)
+            assert isSameType(stateStruct, t1.pointerOf, t2.pointerOf), \
+                "pointerOf differ: %r vs %r" % (t1.pointerOf, t2.pointerOf)
             return t1
         if isinstance(t2, CArrayType):
             assert isSameType(stateStruct, t1.pointerOf, t2.arrayOf)
@@ -3968,8 +3964,7 @@ def getBuiltinTypeForStdIntType(stateStruct, t):
     return getBuiltinTypeForCType(stateStruct, stdint_c_type)
 
 def isIntType(t):
-    while isinstance(t, CTypedef):
-        t = t.type
+    t = resolveTypedef(t)
     if isinstance(t, CBuiltinType):
         if "void" in t.builtinType: return False
         if "float" in t.builtinType or "double" in t.builtinType:
@@ -4231,7 +4226,6 @@ class CStatement(_CBaseWithOptBody):
                     self._op = COp("?:")
                     self._state = 6
                 elif opsDoLeftToRight(stateStruct, self._op.content, token.content, prefix1=self._leftexpr is None):
-                    import copy
                     subStatement = copy.copy(self)
                     self._leftexpr = subStatement
                     self._rightexpr = None
@@ -4269,7 +4263,6 @@ class CStatement(_CBaseWithOptBody):
                         self._rightexpr._cpre3_handle_token(stateStruct, token)
                         self._state = 8
                 elif opsDoLeftToRight(stateStruct, self._op.content, token.content, prefix1=self._leftexpr is None):
-                    import copy
                     subStatement = copy.copy(self)
                     self._leftexpr = subStatement
                     self._rightexpr = None
@@ -5576,7 +5569,7 @@ def cpre3_parse_body(stateStruct, parentCObj, input_iter):
                 and (token.content in stateStruct.vars
                      or token.content in parentCObj.body.vars
                      or (isinstance(parentCObj, CFunc)
-                         and token.content in [a.name for a in parentCObj.args])):
+                         and any(a.name == token.content for a in parentCObj.args))):
                 assert curCObj.name is None
                 CStatement.overtake(curCObj)
                 curCObj._cpre3_handle_token(stateStruct, token)
@@ -5988,15 +5981,13 @@ class CWrapFuncType(CType, CFuncPointerBase):
 
 
 def isPointerType(t, checkWrapValue=False, alsoFuncPtr=False, alsoArray=True):
-    while isinstance(t, CTypedef):
-        t = t.type
+    t = resolveTypedef(t)
     if isinstance(t, CPointerType): return True
     if alsoArray:
         if isinstance(t, CArrayType): return True
     if isinstance(t, CBuiltinType) and t.builtinType == ("void", "*"): return True
     if checkWrapValue and isinstance(t, CWrapValue):
         return isPointerType(t.getCType(None), checkWrapValue=True, alsoFuncPtr=alsoFuncPtr)
-    from inspect import isclass
     if alsoFuncPtr:
         if isinstance(t, CWrapFuncType): return True
         if isinstance(t, CFuncPointerDecl): return True
@@ -6017,7 +6008,6 @@ def isVoidPtrType(t):
 
 def isValueType(t):
     if isinstance(t, (CBuiltinType, CStdIntType, CBitfieldType)): return True
-    from inspect import isclass
     if isclass(t):
         for c in State.StdIntTypes.values():
             if issubclass(t, c): return True

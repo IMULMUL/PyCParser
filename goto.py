@@ -1,102 +1,5 @@
 
 import ast
-import sys
-import six
-
-PY2 = sys.version_info[0] == 2
-
-
-# We could use this funny little hack:
-# background: http://stackoverflow.com/questions/6959360/goto-in-python
-# code from here: http://code.activestate.com/recipes/576944-the-goto-decorator/
-# by Carl Cerecke
-# Licensed under the MIT License
-
-class MissingLabelError(Exception):
-    """'goto' without matching 'label'."""
-    pass
-
-
-def goto(fn):
-    """
-    A function decorator to add the goto command for a function.
-
-    Specify labels like so:
-
-    label .foo
-
-    Goto labels like so:
-
-    goto .foo
-    """
-
-    import dis
-    import new
-
-    labels = {}
-    gotos = {}
-    globalName = None
-    index = 0
-    end = len(fn.func_code.co_code)
-    i = 0
-
-    # scan through the byte codes to find the labels and gotos
-    while i < end:
-        op = ord(fn.func_code.co_code[i])
-        i += 1
-        name = dis.opname[op]
-
-        if op > dis.HAVE_ARGUMENT:
-            b1 = ord(fn.func_code.co_code[i])
-            b2 = ord(fn.func_code.co_code[i+1])
-            num = b2 * 256 + b1
-
-            if name == 'LOAD_GLOBAL':
-                globalName = fn.func_code.co_names[num]
-                index = i - 1
-                i += 2
-                continue
-
-            if name == 'LOAD_ATTR':
-                if globalName == 'label':
-                    labels[fn.func_code.co_names[num]] = index
-                elif globalName == 'goto':
-                    gotos[fn.func_code.co_names[num]] = index
-
-            name = None
-            i += 2
-
-    # no-op the labels
-    ilist = list(fn.func_code.co_code)
-    for label,index in labels.items():
-        ilist[index:index+7] = [chr(dis.opmap['NOP'])]*7
-
-    # change gotos to jumps
-    for label,index in gotos.items():
-        if label not in labels:
-            raise MissingLabelError("Missing label: %s"%label)
-
-        target = labels[label] + 7   # skip NOPs
-        ilist[index] = chr(dis.opmap['JUMP_ABSOLUTE'])
-        ilist[index + 1] = chr(target & 255)
-        ilist[index + 2] = chr(target >> 8)
-
-    # create new function from existing function
-    c = fn.func_code
-    newcode = new.code(c.co_argcount,
-                       c.co_nlocals,
-                       c.co_stacksize,
-                       c.co_flags,
-                       ''.join(ilist),
-                       c.co_consts,
-                       c.co_names,
-                       c.co_varnames,
-                       c.co_filename,
-                       c.co_name,
-                       c.co_firstlineno,
-                       c.co_lnotab)
-    newfn = new.function(newcode,fn.func_globals)
-    return newfn
 
 
 # Or, to avoid messing around with the bytecode, we can go the
@@ -159,9 +62,7 @@ class _Flatten:
         r = []
         for s in body:
             if isinstance(s, ast.If):
-                a = ast.UnaryOp()
-                a.op = ast.Not()
-                a.operand = s.test
+                a = ast.UnaryOp(op=ast.Not(), operand=s.test)
                 goto_final_stmnt = self.make_jump()
                 if s.orelse:
                     goto_orelse_stmnt = self.make_jump()
@@ -179,9 +80,7 @@ class _Flatten:
                 if s.orelse: raise NotImplementedError
                 goto_repeat_stmnt = self.make_jump()
                 r += [GotoLabel(goto_repeat_stmnt.label)]
-                a = ast.UnaryOp()
-                a.op = ast.Not()
-                a.operand = s.test
+                a = ast.UnaryOp(op=ast.Not(), operand=s.test)
                 goto_final_stmnt = self.make_jump()
                 r += [ast.If(test=a, body=[goto_final_stmnt], orelse=[])]
                 # Inside the loop body: `break` jumps past the loop, `continue`
@@ -198,7 +97,7 @@ class _Flatten:
                 goto_final_stmnt = self.make_jump()
                 r += self.flatten(s.body, breakJump=goto_final_stmnt, continueJump=goto_final_stmnt)
                 r += [GotoLabel(goto_final_stmnt.label)]
-            elif isinstance(s, (ast.TryExcept, ast.TryFinally) if PY2 else ast.Try):
+            elif isinstance(s, ast.Try):
                 raise NotImplementedError
             elif isinstance(s, ast.Break):
                 assert breakJump, "found break in unexpected scope"
@@ -212,8 +111,7 @@ class _Flatten:
 
 
 def _ast_for_value(v):
-    if isinstance(v, six.string_types): return ast.Str(s=v)
-    elif isinstance(v, int): return ast.Num(n=v)
+    if isinstance(v, (str, int)): return ast.Constant(value=v)
     else: raise NotImplementedError("type (%r) %r" % (type(v), v))
 
 
@@ -224,20 +122,20 @@ class _HandleGoto:
 
     def handle_goto_stmnt(self, stmnt):
         assert isinstance(stmnt, GotoStatement)
-        a = ast.Assign()
-        a.targets = [ast.Name(id=self.gotoVarName, ctx=ast.Store())]
-        a.value = _ast_for_value(stmnt.label)
+        a = ast.Assign(
+            targets=[ast.Name(id=self.gotoVarName, ctx=ast.Store())],
+            value=_ast_for_value(stmnt.label))
         return [a, ast.Continue()]
 
     def handle_goto_label(self, stmnt):
         assert isinstance(stmnt, GotoLabel)
-        reset_ast = ast.Assign()
-        reset_ast.targets = [ast.Name(id=self.gotoVarName, ctx=ast.Store())]
-        reset_ast.value = ast.Name(id="None", ctx=ast.Load())
-        test_ast = ast.Compare()
-        test_ast.ops = [ast.Eq()]
-        test_ast.left = ast.Name(id=self.gotoVarName, ctx=ast.Store())
-        test_ast.comparators = [_ast_for_value(stmnt.label)]
+        reset_ast = ast.Assign(
+            targets=[ast.Name(id=self.gotoVarName, ctx=ast.Store())],
+            value=ast.Name(id="None", ctx=ast.Load()))
+        test_ast = ast.Compare(
+            left=ast.Name(id=self.gotoVarName, ctx=ast.Store()),
+            ops=[ast.Eq()],
+            comparators=[_ast_for_value(stmnt.label)])
         return [ast.If(test=test_ast, body=[reset_ast], orelse=[])]
 
     def handle_body(self, body):
@@ -271,20 +169,20 @@ class _HandleGoto:
                         sr += self.handle_goto_stmnt(s)
                     else:
                         sr += [s]
-                test_ast = ast.Compare()
-                test_ast.ops = [ast.Is()]
-                test_ast.left = ast.Name(id=self.gotoVarName, ctx=ast.Store())
-                test_ast.comparators = [ast.Name(id="None", ctx=ast.Load())]
+                test_ast = ast.Compare(
+                    left=ast.Name(id=self.gotoVarName, ctx=ast.Store()),
+                    ops=[ast.Is()],
+                    comparators=[ast.Name(id="None", ctx=ast.Load())])
                 r += [ast.If(test=test_ast, body=sr, orelse=[])]
         return r
 
     def wrap_func_body(self, flat_body):
-        var_ast = ast.Assign()
-        var_ast.targets = [ast.Name(id=self.gotoVarName, ctx=ast.Store())]
-        var_ast.value = ast.Name(id="None", ctx=ast.Load())
-        main_loop_ast = ast.While(orelse=[])
-        main_loop_ast.test = ast.Name(id="True", ctx=ast.Load())
-        main_loop_ast.body = self.handle_body(flat_body)
+        var_ast = ast.Assign(
+            targets=[ast.Name(id=self.gotoVarName, ctx=ast.Store())],
+            value=ast.Name(id="None", ctx=ast.Load()))
+        main_loop_ast = ast.While(
+            test=ast.Name(id="True", ctx=ast.Load()),
+            body=self.handle_body(flat_body), orelse=[])
         main_loop_ast.body += [ast.Break()]
         return [var_ast, main_loop_ast]
 

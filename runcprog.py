@@ -86,9 +86,8 @@ def main():
 
         # first c file is program name and first argument
         arguments_to_c_prog = [c_code_files[0]]
-        try: # append everything after the "--" as c program arguments
+        if "--" in argv:  # append everything after the "--" as c program arguments
             arguments_to_c_prog += argv[argv.index("--")+1:]
-        except: ValueError
 
         # return_as_ctype=False as we're expecting a simple int or None for void
         return_code = interpreter.runFunc(
